@@ -1,0 +1,7 @@
+# Python port of the agent-cli, using the same Claude Agent SDK (Python) plus the
+# assignment's Python stack (PyJWT). Install into a virtualenv:
+#   python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+claude-agent-sdk>=0.2.124
+PyJWT>=2.8.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
