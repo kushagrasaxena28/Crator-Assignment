@@ -1,117 +1,157 @@
 # Agent CLI — the Claude Agent SDK client
 
-An interactive command-line agent, built on the **Claude Agent SDK**, that plays the *agent* in
-this system. You talk to it in plain language; it discovers what toolkits and actions it can use
-and calls them — always through the backend's HTTP boundary, so the backend's permission and audit
-logic runs on **every single call**.
+An interactive command-line agent, built on the **Claude Agent SDK**, that plays the *agent* in this
+system. You talk to it in plain language; it discovers what toolkits and actions it can use and
+calls them — always through the backend's HTTP boundary, so the backend's permission and audit logic
+runs on **every single call**.
 
 The agent has the SDK's standard built-in tools (**Read, Write, Edit, Bash**) plus exactly **one**
-custom tool, **`GenerateJWT`**. It is deliberately given **no** direct `read_item` / `create_item`
-/ etc. tool — the only way it can touch an external service is `Bash` + `curl` against the backend.
+custom tool, **`GenerateJWT`**. It is deliberately given **no** direct `read_item` / `create_item` /
+etc. tool — the only way it can touch an external service is `Bash` + `curl` against the backend.
 That is the whole point: funnelling every call through one HTTP boundary is what lets the backend
 enforce permissions and record an audit trail on each attempt.
 
-**Stack:** Python · Claude Agent SDK · PyJWT · httpx · python-dotenv. This folder is a plain Python
-package (no Django, no `manage.py`) — it is the backend's *client* and works the same regardless of
-how the backend is implemented.
+**Stack:** Python 3.14 · Claude Agent SDK · PyJWT · httpx · python-dotenv. This folder is a plain
+Python package (no Django, no `manage.py`) — it is the backend's *client*.
+
+> The feature work and the end-to-end flow are in the [top-level README](../README.md). This
+> document is the CLI reference, plus what changed since the last commit.
+
+---
+
+## Fixes since the last commit
+
+**Configuration was loaded relative to the current directory.** `load_dotenv()` searched upward from
+wherever the process happened to start, so running the CLI from anywhere other than `agent-cli/`
+silently found no configuration and failed as if nothing were set. It now loads from a path anchored
+to the module, so the behaviour is the same whichever directory you launch from.
+
+**An unedited `.env` failed with an opaque `401`.** `cp .env.example .env` leaves `AGENT_SECRET` as
+a placeholder, and the backend deliberately returns one generic `invalid_credentials` for every
+failed exchange so that agent ids cannot be enumerated. The result was a message that told you
+nothing. The CLI now recognises the placeholder before making any request and says exactly what to
+replace and where. A wrong-but-real secret gets its own message, naming the most likely cause: a
+re-seeded database issues a new one.
+
+**An unedited `ANTHROPIC_API_KEY` broke a setup that would otherwise have worked.** `.env.example`
+shipped the key line *uncommented* with a placeholder value. The SDK treats any set value as a
+configured credential and stops falling back to your `claude` CLI login — so copying the example and
+not editing it was the one configuration that could not work, while looking correct. The line now
+ships commented out, with `claude auth status` documented as the check.
+
+**Comments referred to files that do not exist.** Several modules described themselves as a
+"Faithful Python port of session.ts" / "ticketWatcher.ts" — there is no TypeScript in this
+repository. Removed.
+
+**Broken links.** This README and the top-level one referred to `agent-cli-script/`; the directory
+is `agent-cli/`.
+
+---
+
+## The credential boundary
+
+This CLI authenticates as an **agent**, using an agent id and an agent secret. It does **not** hold
+the owning user's password, and it must never be given one.
+
+The reason is concrete rather than theoretical: this process runs a model with shell access, so
+anything readable from here is readable by the agent. If a user password lived in `.env`, the agent
+could read it, mint a **user** token, and approve its own held actions — defeating the entire
+approval queue. An agent secret can only ever be exchanged for an agent token, and the backend
+rejects an agent token at `resolve/`.
+
+So approving a ticket is something *you* do, from your own terminal, with your own credentials.
 
 ---
 
 ## Prerequisites
 
-- **Python 3.11+**
-- **Node.js** and the `claude` CLI on your `PATH` — the Claude Agent SDK drives Claude Code as a
-  subprocess. Install it with `npm install -g @anthropic-ai/claude-code` if you don't already have
-  it.
-- The **backend running** (see [`../backend-django`](../backend-django)) at
-  `http://localhost:8000` — or wherever `BACKEND_URL` points — seeded with the demo agent whose
-  UUID is in `AGENT_ID`.
-
----
+- **Python 3.14+** (same floor as the backend). On macOS: `brew install python@3.14`.
+- **Node.js** and the `claude` CLI on your `PATH` — the SDK drives Claude Code as a subprocess.
+  Install with `npm install -g @anthropic-ai/claude-code`.
+- The **backend running** (see [`../backend`](../backend)) and **already seeded** — the agent
+  authenticates with a secret that does not exist until `python manage.py seed` has run.
 
 ## Setup
 
 ```bash
-cd agent-cli-script
-python3 -m venv .venv
-source .venv/bin/activate           # Windows: .venv\Scripts\activate
+cd agent-cli
+python3.14 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env                # then edit .env
+cp .env.example .env
 ```
 
-`.env` values:
+Then edit `.env`:
 
 | Key | Purpose |
 |---|---|
-| `BACKEND_URL` | Where the backend lives (default `http://localhost:8000`). |
-| `AGENT_ID` | The seeded demo agent's UUID. The default already matches what `python manage.py seed` creates, so it works unmodified. |
-| `ANTHROPIC_API_KEY` | **Required** on any machine that doesn't already have a logged-in `claude` CLI (assume you need it). Get one at <https://console.anthropic.com/settings/keys>. The SDK's subprocess inherits this process's environment, so once it's here nothing else needs wiring. |
+| `BACKEND_URL` | Where the backend lives (default `http://localhost:8000`) |
+| `AGENT_ID` | The seeded demo agent's UUID — the default already matches `seed`, so leave it |
+| `AGENT_SECRET` | **You must paste this.** `seed` prints the exact `AGENT_SECRET="…"` line to copy |
+| `ANTHROPIC_API_KEY` | **Only if** `claude auth status` says you are not logged in. Ships commented out; leave it that way if you are |
 
-> If you're relying on an existing `claude` login instead of a key, leave the `ANTHROPIC_API_KEY`
-> line **commented out** — an uncommented-but-empty value is not the same as unset.
-
----
-
-## Run
-
-With the backend running:
+Never add the user's password to this file — see [the credential boundary](#the-credential-boundary).
 
 ```bash
 python -m agent_cli_script
 ```
 
-You'll see:
+You should see `Session established. Token valid until …`. If instead it tells you `AGENT_SECRET`
+is still the placeholder, you skipped the paste step above.
+
+---
+
+## Try it
+
+### Plug in an MCP server
 
 ```
-Establishing session...
-Session established. Token valid until 14:32:10.
-Type your request ("exit" to quit).
-
-User:
+User: add an mcp server called deepwiki at https://mcp.deepwiki.com/mcp
+User: what toolkits do I have now?
+User: using deepwiki, what does the pallets/flask documentation cover?
 ```
 
-A backend session (a JWT) is established *before* the first prompt, so the agent is ready to act on
-your very first message. The conversation keeps its history for as long as the process runs. Type
-`exit` / `quit` / Ctrl-D to leave.
+The agent asks for whatever it still needs (a short name, the URL, auth headers if the server wants
+them), registers it, and its tools are usable immediately — through the same permission and audit
+path as everything else.
 
-### Try the full permission demo
+`mcp.deepwiki.com` needs no authentication, which makes it the easiest thing to try. Servers wanting
+a static bearer token work too — give the agent `{"Authorization": "Bearer <token>"}` and it
+forwards it (GitHub's MCP accepts a personal access token this way). Servers behind an interactive
+**OAuth** flow, such as Notion's, cannot be added: that needs a browser and a callback URL. The
+agent will tell you which case you have hit.
+
+### The permission demo
 
 ```
-User: what can I access?
-User: read the sample item
-User: create an item called "Meeting Notes" with content "Discuss Q3 roadmap"
-User: delete the sample item
+User: read the sample item                 # always_allow     → runs immediately
+User: create an item called "Meeting Notes" # requires_approval → ticket id, waits for a human
+User: delete the sample item               # always_deny      → refused
 ```
 
-You'll see all three permission outcomes surfaced in plain language:
-
-- **always_allow** → runs immediately (`read_item`)
-- **requires_approval** → returns a ticket id and waits for a human (`create_item`)
-- **always_deny** → refused (`delete_item`)
-
-Approve or reject a pending ticket from a **separate terminal** — the reviewer's endpoint uses
-admin credentials, not the agent's JWT (the agent can never resolve its own tickets):
+Approve a pending ticket from a **separate terminal**, as yourself. The agent cannot — its token is
+the wrong type and the backend rejects it:
 
 ```bash
-curl -X PATCH http://localhost:8000/api/external-services/approvals/<ticket_id>/resolve/ \
-  -u admin:<ADMIN_PASSWORD from backend-django/.env> \
-  -H "Content-Type: application/json" \
+BASE=http://localhost:8000
+UTOK=$(curl -s -X POST $BASE/api/auth/user/token/ -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"<the password seed printed>"}' \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+curl -X PATCH $BASE/api/external-services/approvals/<ticket_id>/resolve/ \
+  -H "Authorization: Bearer $UTOK" -H "Content-Type: application/json" \
   -d '{"decision":"approved"}'
-# or reject: -d '{"decision":"rejected","reason":"not needed"}'
 ```
 
-The moment you resolve it, the CLI's **background ticket watcher** notices on its own — it polls
-the backend directly, independent of the conversation — and prints an unprompted notification
-within ~2 seconds, even if you're mid-typing:
+The moment you resolve it, the CLI's **background ticket watcher** notices on its own — it polls the
+backend directly, independent of the conversation — and prints an unprompted notification within ~2
+seconds, even if you are mid-typing:
 
 ```
 ● Ticket 81d8f17c was approved.
   Result: {"item": {"id": "...", "name": "Meeting Notes", ...}}
 ```
-
-You can then ask, in the same session, `check on that ticket`, and the agent will report the real
-outcome from the backend.
 
 ---
 
@@ -120,38 +160,34 @@ outcome from the backend.
 ```
 agent_cli_script/
 ├── __main__.py         entry point: the REPL loop, live token streaming, orchestration
-├── system_prompt.py    the agent's operating instructions (kept separate so __main__ stays short)
-├── session.py          JWT fetch + in-memory cache + transparent refresh
+├── system_prompt.py    the agent's operating instructions
+├── session.py          agent-token fetch + in-memory cache + transparent refresh
 ├── ticket_watcher.py   background poller for approval-ticket status changes
 └── tools/
-    └── generate_jwt.py  the one custom tool exposed to the model (in-process MCP server)
+    └── generate_jwt.py the one custom tool exposed to the model (in-process MCP server)
 ```
 
-Each module has one job, and the seams are clean: `session.py` doesn't know about the CLI or the
-tools; `__main__.py` doesn't know *how* tokens are fetched, only that `get_valid_token()` returns
-one.
-
-A few design points worth calling out:
-
-- **The signing secret never lives here.** `GenerateJWT` doesn't sign anything — it asks the
-  backend's `/api/auth/token/` endpoint for a token and caches it. This process *cannot* forge a
-  token; it can only request one for an agent the backend already knows.
-- **Long sessions survive token expiry.** The cache refreshes ~60s before the ~20-minute expiry,
-  and any `401` triggers a forced refresh + retry, so a token expiring mid-conversation never ends
-  the session.
+- **The signing secret never lives here.** `GenerateJWT` does not sign anything — it exchanges the
+  agent id and secret at `/api/auth/agent/token/` and caches the result. This process cannot forge a
+  token, and cannot obtain one of a different type.
+- **Long sessions survive token expiry.** The cache refreshes ~60s before the ~20-minute expiry, and
+  any `401` triggers a forced refresh and retry.
 - **The watcher is independent of the model.** Approvals reach you whether or not you ask the agent
-  to check — the polling loop runs on its own asyncio task.
-- **`bypassPermissions`** is used for the SDK's *local* tool-approval prompt only. It's safe here
-  because the agent only ever curls `localhost`; the real permission enforcement is the backend's,
-  not the SDK's.
+  to check.
+- **`bypassPermissions`** disables the SDK's *local* tool prompt only. It is safe because the agent
+  only ever curls the backend; the real enforcement is server-side. That is the whole thesis: never
+  trust the client.
 
 ---
 
-## Notes & assumptions
+## Notes
 
-- The CLI **never** calls the `resolve/` endpoint itself — resolving a ticket is a human action, by
-  design. The system prompt instructs the agent to refuse "just approve it" requests and explain
-  that a human with admin access must do it.
-- `PyJWT` is used only as a fallback to read a token's `exp` claim when the backend's token response
-  omits `expires_at`; it never signs or verifies (the secret is backend-only).
-- `.env` is git-ignored — anything you put there is never committed.
+- The CLI **never** calls `resolve/` itself. The system prompt tells the agent to refuse "just
+  approve it" requests — but note that **the prompt is not the control**: the authentication class
+  is. A prompt is advisory; the `401` is enforcement.
+- `PyJWT` is used only to read a token's `exp` claim when the backend's response omits `expires_at`.
+  It never signs or verifies.
+- The ticket watcher finds ticket ids by regex-scanning the model's text output. It works, but it is
+  the weakest seam here: if the model paraphrases or truncates an id, the watcher misses it.
+  Returning ticket ids structurally from the tool layer would be the cleaner design.
+- `.env` is git-ignored.

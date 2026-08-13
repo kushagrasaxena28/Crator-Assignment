@@ -2,8 +2,7 @@
 the backend, so this process can't forge a token. Cheap to call — returns the cached token if
 still valid, else fetches a new one.
 
-Faithful Python port of tools/generateJwt.ts, exposed as an in-process MCP server; the model
-sees it as `mcp__jwt__GenerateJWT`.
+Exposed as an in-process MCP server; the model sees it as `mcp__jwt__GenerateJWT`.
 """
 
 from datetime import datetime, timezone

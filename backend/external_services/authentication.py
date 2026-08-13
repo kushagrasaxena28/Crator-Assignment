@@ -1,78 +1,128 @@
-"""DRF authentication classes — the idiomatic Django home for what Express did in middleware.
+"""DRF authentication classes — one per identity, plus one that serves either.
 
-`AgentJWTAuthentication` guards the agent-facing endpoints; `AdminBasicAuthentication` guards the
-human reviewer's resolve/ endpoint. Both always raise on failure (never return None) so a missing
-credential is a clean 401, and both define `authenticate_header` so DRF returns 401 rather than 403.
+`AgentJWTAuthentication` guards the agent-facing endpoints (the catalog and calling actions);
+`UserJWTAuthentication` guards the human-only controls (resolving a ticket, setting permissions).
+Each accepts only its own token type, so an agent token presented to an approval endpoint is a
+401 rather than a privilege escalation.
+
+All of them always raise on failure and never return `None`. That distinction is load-bearing in
+DRF: returning `None` means "not my credential type, try the next authenticator", and if every
+authenticator returns `None` the request reaches the view unauthenticated. Raising fails closed.
+They also define `authenticate_header`, without which DRF downgrades the 401 to a 403.
+
+That fail-closed behaviour is also why `AgentOrUserJWTAuthentication` exists as a single class
+rather than as a list of two: DRF re-raises the first authenticator's failure instead of moving on
+to the next, so two raising classes can never be chained.
 """
 
-import base64
-
 import jwt
-from django.conf import settings
 from rest_framework import authentication, exceptions
 
-from .models import get_agent
-from .tokens import decode_token
+from .models import get_agent, get_user
+from .tokens import TOKEN_TYPE_AGENT, TOKEN_TYPE_USER, decode_any_token, decode_token
+
+
+def _bearer_token(request) -> str:
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        raise exceptions.AuthenticationFailed(
+            "Authorization: Bearer <jwt> header is required.", code="missing_token"
+        )
+    return header[len("Bearer "):]
+
+
+# Deliberately one message for every failure mode — bad signature, expiry, and wrong token type all
+# look identical from outside, so a caller can't probe for which one they hit.
+def _invalid_token() -> exceptions.AuthenticationFailed:
+    return exceptions.AuthenticationFailed(
+        "Token is malformed, expired, of the wrong type, or has a bad signature.",
+        code="invalid_token",
+    )
+
+
+def _decode(token: str, expected_type: str) -> dict:
+    try:
+        return decode_token(token, expected_type=expected_type)
+    except jwt.PyJWTError:
+        raise _invalid_token()
+
+
+def _load_agent(claims: dict):
+    """Resolve an agent from verified claims, checking that it — and the user it acts for — are
+    still active. Both checks run on every request, so disabling either takes effect immediately,
+    even while a previously-issued token is still within its lifetime."""
+    agent_id = claims.get("agent_id")
+    if not agent_id:
+        raise exceptions.AuthenticationFailed("Token payload is missing agent_id.", code="invalid_token")
+
+    agent = get_agent(agent_id)
+    if agent is None or not agent.is_active:
+        raise exceptions.AuthenticationFailed(
+            "Agent no longer exists or is inactive.", code="agent_inactive_or_missing"
+        )
+    if not agent.owner.is_active:
+        raise exceptions.AuthenticationFailed(
+            "The user this agent acts for is inactive.", code="owner_inactive"
+        )
+    return agent
+
+
+def _load_user(claims: dict):
+    user_id = claims.get("user_id")
+    if not user_id:
+        raise exceptions.AuthenticationFailed("Token payload is missing user_id.", code="invalid_token")
+
+    user = get_user(user_id)
+    if user is None or not user.is_active:
+        raise exceptions.AuthenticationFailed(
+            "User no longer exists or is inactive.", code="user_inactive_or_missing"
+        )
+    return user
 
 
 class AgentJWTAuthentication(authentication.BaseAuthentication):
-    """Verify the Bearer JWT (signature + expiry) and that the agent still exists and is active.
-    The active check runs on every request, so an agent disabled mid-session is rejected
-    immediately even with an otherwise-valid token."""
+    """Accepts only an agent token. Guards the catalog and the call/ endpoint."""
 
     def authenticate(self, request):
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            raise exceptions.AuthenticationFailed(
-                "Authorization: Bearer <jwt> header is required.", code="missing_token"
-            )
-        token = header[len("Bearer "):]
-
-        try:
-            payload = decode_token(token)
-        except jwt.PyJWTError:
-            raise exceptions.AuthenticationFailed(
-                "Token is malformed, expired, or has a bad signature.", code="invalid_token"
-            )
-
-        agent_id = payload.get("agent_id")
-        if not agent_id:
-            raise exceptions.AuthenticationFailed(
-                "Token payload is missing agent_id.", code="invalid_token"
-            )
-
-        agent = get_agent(agent_id)
-        if agent is None or not agent.is_active:
-            raise exceptions.AuthenticationFailed(
-                "Agent no longer exists or is inactive.", code="agent_inactive_or_missing"
-            )
-        return (agent, token)
+        token = _bearer_token(request)
+        claims = _decode(token, TOKEN_TYPE_AGENT)
+        return (_load_agent(claims), claims)
 
     def authenticate_header(self, request):
         return "Bearer"
 
 
-class AdminBasicAuthentication(authentication.BaseAuthentication):
-    """HTTP Basic Auth against ADMIN_USER / ADMIN_PASSWORD. Callable directly with
-    `curl -u admin:password`, no session cookie needed. The resolve/ view never reads
-    `request.user` — the admin's authority is the HTTP Basic credential itself, not an
-    agent identity — so the authenticated principal is just the string "admin"."""
+class UserJWTAuthentication(authentication.BaseAuthentication):
+    """Accepts only a user token. This is the credential behind every control an agent must never
+    hold: approving or rejecting a held action, and changing an agent's permissions."""
 
     def authenticate(self, request):
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            raise exceptions.AuthenticationFailed("HTTP Basic Auth required.", code="missing_credentials")
-
-        try:
-            decoded = base64.b64decode(header[len("Basic "):]).decode("utf-8")
-        except (ValueError, UnicodeDecodeError):
-            raise exceptions.AuthenticationFailed("Bad admin username or password.", code="invalid_credentials")
-
-        username, _, password = decoded.partition(":")
-        if username != settings.ADMIN_USER or password != settings.ADMIN_PASSWORD:
-            raise exceptions.AuthenticationFailed("Bad admin username or password.", code="invalid_credentials")
-
-        return ("admin", None)
+        token = _bearer_token(request)
+        claims = _decode(token, TOKEN_TYPE_USER)
+        return (_load_user(claims), claims)
 
     def authenticate_header(self, request):
-        return "Basic"
+        return "Bearer"
+
+
+class AgentOrUserJWTAuthentication(authentication.BaseAuthentication):
+    """Accepts either token type, for endpoints that serve both but answer differently depending on
+    who is asking (the audit log). The view is responsible for scoping its results to whichever
+    identity `request.user` turns out to be."""
+
+    def authenticate(self, request):
+        token = _bearer_token(request)
+        try:
+            claims = decode_any_token(token)
+        except jwt.PyJWTError:
+            raise _invalid_token()
+
+        token_type = claims.get("typ")
+        if token_type == TOKEN_TYPE_AGENT:
+            return (_load_agent(claims), claims)
+        if token_type == TOKEN_TYPE_USER:
+            return (_load_user(claims), claims)
+        raise _invalid_token()
+
+    def authenticate_header(self, request):
+        return "Bearer"

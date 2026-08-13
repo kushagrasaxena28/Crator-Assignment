@@ -1,6 +1,6 @@
 """Permission resolution — completely toolkit-agnostic. Given an agent and an action, it answers
 one question: what is this agent's effective permission for this action? A per-agent override row
-wins; otherwise the action's default applies. It knows nothing about items, github, notion, etc.
+wins; otherwise the action's default applies. It never learns that any particular toolkit exists.
 """
 
 from .models import PermissionOverride

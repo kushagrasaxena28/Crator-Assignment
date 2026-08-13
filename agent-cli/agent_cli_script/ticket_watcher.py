@@ -1,8 +1,5 @@
 """Background watcher, independent of the model: polls the backend on its own timer so an
 approval/rejection shows up without the user having to ask.
-
-Faithful Python port of ticketWatcher.ts, using an asyncio background task in place of
-setInterval.
 """
 
 import asyncio

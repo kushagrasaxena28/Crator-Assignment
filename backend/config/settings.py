@@ -1,8 +1,9 @@
 """Django settings for the external-services permissions layer.
 
 One SQLite database, one app (`external_services`), DRF for the REST layer. Configuration that
-differs between machines (secrets, the JWT signing key, admin credentials, Notion keys) is read
-from the environment via a `.env` file; see `.env.example`.
+differs between machines (Django's secret key, the JWT signing key) is read from the environment
+via a `.env` file; see `.env.example`. User and agent credentials are not configuration — they
+live in the database as hashes.
 """
 
 import os
@@ -21,7 +22,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-insecure-key-change-in-production")
-DEBUG = _env_bool("DJANGO_DEBUG", default=True)
+# Defaults to False: a missing or misspelled DJANGO_DEBUG should fail towards the safe setting,
+# never quietly serve tracebacks and accept any Host header.
+DEBUG = _env_bool("DJANGO_DEBUG", default=False)
 ALLOWED_HOSTS = ["*"] if DEBUG else os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
 INSTALLED_APPS = [
@@ -68,8 +71,28 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        # SQLite needs configuring before it will honour the row lock the approval endpoint takes.
+        # By default Django opens a DEFERRED transaction, so concurrent writers each acquire a read
+        # lock first and then deadlock trying to upgrade it — SQLite gives up immediately with
+        # "database is locked" rather than waiting, which surfaced as a 500 for every loser of the
+        # race instead of a clean 409.
+        "OPTIONS": {
+            # Take the write lock when the transaction opens rather than on first write, so
+            # concurrent writers queue instead of deadlocking on an upgrade.
+            "transaction_mode": "IMMEDIATE",
+            # ...and having queued, actually wait for their turn instead of erroring instantly.
+            "timeout": 20,
+            # WAL lets readers proceed while one writer holds the lock, so polling the audit log
+            # or a ticket's status doesn't contend with a resolution in flight.
+            "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        },
     }
 }
+
+# Our own user model, so the API's human identity and Django's admin/superuser account are the
+# same thing rather than two parallel notions of "user". It subclasses AbstractUser and only
+# overrides the primary key, so everything below actually applies to it.
+AUTH_USER_MODEL = "external_services.User"
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -90,30 +113,37 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # from the environment, rather than each module calling os.environ.get() independently.
 JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_EXPIRES_IN_MINUTES = int(os.environ.get("JWT_EXPIRES_IN_MINUTES", "20"))
-ADMIN_USER = os.environ.get("ADMIN_USER")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
-NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
-NOTION_PARENT_PAGE_ID = os.environ.get("NOTION_PARENT_PAGE_ID")
 
-# Agent endpoints authenticate with a short-lived JWT; the auth class raises on any failure, so
-# a missing/invalid token is a clean 401 without needing a permission class. The two exceptions
-# (token issuance, admin resolve/) set their own authentication per-view.
+# Most endpoints are agent-facing, so the agent token is the default. The human-only controls
+# (resolving a ticket, setting permissions) and the audit log override this per-view, and token
+# issuance disables authentication entirely — it *is* the authentication step.
+#
+# `IsAuthenticated` is defence in depth rather than the primary control: the auth classes already
+# raise on failure, so an unauthenticated request never reaches a view. But that made security rest
+# entirely on every future auth class remembering to raise instead of returning None, which is a
+# thin thing to depend on. Both our User and Agent models expose `is_authenticated` so this class
+# understands them.
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "external_services.authentication.AgentJWTAuthentication",
     ],
-    "DEFAULT_PERMISSION_CLASSES": [],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
     "EXCEPTION_HANDLER": "external_services.exceptions.api_exception_handler",
     "UNAUTHENTICATED_USER": None,
 }
 
-# We report unexpected API errors ourselves as one clean line (see external_services.exceptions);
-# this silences Django's default duplicate traceback dump. Per-request status lines are unaffected.
+# Unexpected API errors are reported as one clean line by external_services.exceptions, so
+# `django.request` is set to a plain handler at WARNING rather than being silenced: routing it to a
+# NullHandler suppressed every 4xx/5xx the custom handler doesn't cover too, which made a genuine
+# 500 nearly impossible to diagnose.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"null": {"class": "logging.NullHandler"}},
+    "formatters": {"simple": {"format": "[{levelname}] {name}: {message}", "style": "{"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "simple"}},
     "loggers": {
-        "django.request": {"handlers": ["null"], "propagate": False},
+        "django.request": {"handlers": ["console"], "level": "WARNING", "propagate": False},
     },
 }

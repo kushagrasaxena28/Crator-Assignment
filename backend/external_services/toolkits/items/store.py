@@ -1,10 +1,10 @@
-"""In-memory store for the `items` mock toolkit — simulates an external service's own data, the
-same way `notion/client.py` talks to Notion's real API. State lives only in this process's memory
-and resets on restart; that's expected of a mock external service, not a bug — a real `items` MCP
-would own its data itself, the same way Notion owns its own pages.
+"""In-memory store for the `items` mock toolkit — it stands in for an external service's own data.
+State lives only in this process's memory and resets on restart; that's expected of a mock external
+service, not a bug — a real `items` MCP server would own its data itself, and this database would
+never be where it lived.
 """
 
-import uuid
+from uuid import uuid7
 
 _SAMPLE_ITEM_ID = "10000000-0000-0000-0000-000000000001"
 
@@ -22,7 +22,7 @@ def get(item_id: str) -> dict | None:
 
 
 def create(name: str, content: str) -> dict:
-    item_id = str(uuid.uuid4())
+    item_id = str(uuid7())
     item = {"id": item_id, "name": name, "content": content}
     _items[item_id] = item
     return item
